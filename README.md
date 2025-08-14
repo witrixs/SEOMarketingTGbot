@@ -87,7 +87,6 @@ python main.py
 |------------|----------|--------------|
 | `DATABASE_PATH` | Путь к БД | `./bot.db` |
 | `DEFAULT_GLOBAL_LINK` | Глобальная ссылка | `None` |
-| `DEFAULT_DESTINATION_CHAT_ID` | Чат для рассылки | `None` |
 | `TZ` | Часовой пояс | `Europe/Moscow` |
 
 ⚠️ **Никогда не публикуйте свои токены и ключи!**
