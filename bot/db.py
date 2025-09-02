@@ -273,6 +273,13 @@ class Database:
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
 
+    async def count_all_subscribers(self) -> int:
+        async with self.connection.execute(
+            "SELECT COUNT(*) FROM subscribers"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
     async def count_new_subscribers_since(self, since_ts: int) -> int:
         async with self.connection.execute(
             "SELECT COUNT(*) FROM subscribers WHERE is_active = 1 AND joined_at >= ?",

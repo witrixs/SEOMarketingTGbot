@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Optional
+import pytz
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
@@ -14,6 +15,8 @@ from bot.services.posts import send_post_to_chat
 
 
 logger = logging.getLogger(__name__)
+
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 
 async def _send_post_to_all_subscribers(bot: Bot, db: Database, post: dict) -> int:
@@ -65,7 +68,7 @@ async def _run_due_schedules(bot: Bot, db: Database, now_ts: int) -> None:
 
 
 def _current_local_minute() -> tuple[int, int, int, int]:
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
     wday = (now.weekday())  # Monday=0 .. Sunday=6
     return wday, now.hour, now.minute, now.year * 10000 + now.month * 100 + now.day
 

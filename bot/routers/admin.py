@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Set, List
+import pytz
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -21,13 +22,65 @@ from bot.keyboards import (
     weekly_days_kb,
     posts_page_kb,
 )
-from bot.services.posts import send_post_to_chat
+from bot.services.posts import send_post_to_chat, send_post_to_all_subscribers
 from bot.deps import get_db, get_config
 
 router = Router(name="admin")
 
 PAGE_SIZE = 2
 WEEKDAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+
+def to_moscow_time(timestamp: int) -> datetime:
+    """Конвертирует timestamp в московское время"""
+    return datetime.fromtimestamp(timestamp, tz=MOSCOW_TZ)
+
+
+# Кэш для статистики
+_stats_cache = {
+    "total_users": None,
+    "today_users": None,
+    "last_update": None
+}
+
+
+async def get_stats_data(db, force_refresh: bool = False):
+    """Получить данные статистики с кэшированием"""
+    global _stats_cache
+    
+    # Если это принудительное обновление или кэш пустой, обновляем данные
+    if force_refresh or _stats_cache["total_users"] is None:
+        start_of_day = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        today_users = await db.count_new_subscribers_since(start_of_day)
+        total_users = await db.count_all_subscribers()
+        
+        _stats_cache = {
+            "total_users": total_users,
+            "today_users": today_users,
+            "last_update": time.time()
+        }
+        
+        return total_users, today_users, True  # True означает, что данные обновлены
+    
+    # Если кэш есть, проверяем только количество пользователей (быстрая проверка)
+    start_of_day = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    current_today_users = await db.count_new_subscribers_since(start_of_day)
+    current_total_users = await db.count_all_subscribers()
+    
+    # Если данные не изменились, возвращаем кэшированные
+    if (current_total_users == _stats_cache["total_users"] and 
+        current_today_users == _stats_cache["today_users"]):
+        return _stats_cache["total_users"], _stats_cache["today_users"], False  # False означает, что данные не изменились
+    
+    # Если данные изменились, обновляем кэш
+    _stats_cache = {
+        "total_users": current_total_users,
+        "today_users": current_today_users,
+        "last_update": time.time()
+    }
+    
+    return current_total_users, current_today_users, True
 
 
 class CreatePostFSM(StatesGroup):
@@ -178,7 +231,7 @@ async def open_post(cb: CallbackQuery) -> None:
     ) as cur:
         rows = await cur.fetchall()
         for row in rows:
-            tm = datetime.fromtimestamp(row[0]).strftime("%Y-%m-%d %H:%M")
+            tm = to_moscow_time(row[0]).strftime("%Y-%m-%d %H:%M")
             rep = _format_repeat_interval(row[1])
             status = "⏸" if row[2] else "▶️"
             oneoff_lines.append(f"{status} {tm} ({rep})")
@@ -307,18 +360,27 @@ async def save_or_send(message: Message, state: FSMContext) -> None:
     db = get_db()
 
     if choice in {"сейчас", "now"}:
-        await send_post_to_chat(
+        # Отправляем пост всем подписчикам
+        stats = await send_post_to_all_subscribers(
             bot=message.bot,
             db=db,
-            chat_id=message.chat.id,
             content_type=data["content_type"],
             file_id=data.get("file_id"),
             text=data.get("text"),
             link_override=data.get("link_override"),
             button_text_override=data.get("button_text"),
         )
+        
         await state.clear()
-        await message.answer("Отправлено.", reply_markup=admin_main_kb())
+        
+        # Показываем статистику рассылки
+        stats_message = (
+            f"📊 Рассылка завершена!\n\n"
+            f"✅ Отправлено: {stats['sent']} пользователям\n"
+            f"🚫 Заблокировали бота: {stats['blocked']} пользователей"
+        )
+        
+        await message.answer(stats_message, reply_markup=admin_main_kb())
         return
 
     if choice in {"сохранить", "save"}:
@@ -477,7 +539,7 @@ async def list_schedules(cb: CallbackQuery) -> None:
     lines = []
     for s in schedules[:20]:
         status = "⏸" if s["is_paused"] else ("🗑" if s["is_deleted"] else "▶️")
-        lines.append(f"Один раз: {status} ID {s['id']} • пост {s['post_id']} • {datetime.fromtimestamp(s['next_run_at']).strftime('%Y-%m-%d %H:%M')} ({_format_repeat_interval(s['repeat_interval'])})")
+        lines.append(f"Один раз: {status} ID {s['id']} • пост {s['post_id']} • {to_moscow_time(s['next_run_at']).strftime('%Y-%m-%d %H:%M')} ({_format_repeat_interval(s['repeat_interval'])})")
     for ws in weekly[:20]:
         status = "⏸" if ws["is_paused"] else "▶️"
         days = _format_days_mask(ws["days_mask"])
@@ -490,37 +552,60 @@ async def list_schedules(cb: CallbackQuery) -> None:
 async def admin_stats(cb: CallbackQuery) -> None:
     if not await _ensure_admin(cb):
         return
-    db = get_db()
+    
+    try:
+        db = get_db()
 
-    start_of_day = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    today_users = await db.count_new_subscribers_since(start_of_day)
-    total_users = await db.count_active_subscribers()
+        # Определяем, это обновление или первое открытие
+        is_refresh = cb.data == "admin:stats_refresh"
+        
+        # Получаем данные статистики с кэшированием
+        total_users, today_users, data_updated = await get_stats_data(db, force_refresh=is_refresh)
+        
+        # Если это обновление и данные не изменились, показываем сообщение
+        if is_refresh and not data_updated:
+            await cb.answer("📊 Данные не изменились", show_alert=True)
+            return
 
-    end_of_day = start_of_day + 24 * 3600
-    todays_oneoff = await db.list_schedules_for_day(start_of_day, end_of_day) if hasattr(db, 'list_schedules_for_day') else []
-    wday = datetime.now().weekday()
-    todays_weekly = await db.list_weekly_for_day(wday)
+        # Получаем данные о постах (это быстрая операция)
+        start_of_day = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        end_of_day = start_of_day + 24 * 3600
+        todays_oneoff = await db.list_schedules_for_day(start_of_day, end_of_day) if hasattr(db, 'list_schedules_for_day') else []
+        wday = datetime.now().weekday()
+        todays_weekly = await db.list_weekly_for_day(wday)
 
-    lines = [
-        f"Юзеров сегодня: {today_users}",
-        f"Всего юзеров: {total_users}",
-        "",
-        "Посты сегодня:",
-    ]
-    if not todays_oneoff and not todays_weekly:
-        lines.append("— нет запланированных")
-    else:
-        for it in todays_oneoff:
-            tm = datetime.fromtimestamp(it["next_run_at"]).strftime("%H:%M")
-            title = it.get("title") or (it.get("text") or "").split("\n", 1)[0][:40]
-            lines.append(f"{tm} — {title}")
-        for it in todays_weekly:
-            tm = f"{it['hour']:02d}:{it['minute']:02d}"
-            title = it.get("title") or (it.get("text") or "").split("\n", 1)[0][:40]
-            lines.append(f"{tm} — {title}")
+        lines = [
+            f"Юзеров сегодня: {today_users}",
+            f"Всего юзеров: {total_users}",
+            "",
+            "Посты сегодня:",
+        ]
+        if not todays_oneoff and not todays_weekly:
+            lines.append("— нет запланированных")
+        else:
+            for it in todays_oneoff:
+                tm = to_moscow_time(it["next_run_at"]).strftime("%H:%M")
+                title = it.get("title") or (it.get("text") or "").split("\n", 1)[0][:40]
+                lines.append(f"{tm} — {title}")
+            for it in todays_weekly:
+                tm = f"{it['hour']:02d}:{it['minute']:02d}"
+                title = it.get("title") or (it.get("text") or "").split("\n", 1)[0][:40]
+                lines.append(f"{tm} — {title}")
 
-    await cb.message.edit_text("\n".join(lines), reply_markup=stats_kb())
-    await cb.answer()
+        await cb.message.edit_text("\n".join(lines), reply_markup=stats_kb())
+        
+        # Показываем соответствующее сообщение
+        if is_refresh:
+            await cb.answer("📊 Статистика обновлена")
+        else:
+            await cb.answer()
+            
+    except Exception as e:
+        # Если произошла ошибка, просто отвечаем на callback
+        try:
+            await cb.answer("❌ Ошибка при загрузке статистики")
+        except:
+            pass  # Игнорируем ошибки с callback
 
 
 @router.callback_query(F.data.startswith("post:delete:"))
@@ -538,7 +623,7 @@ async def delete_post(cb: CallbackQuery) -> None:
         lines = [f"⚠️ Пост ID {post_id} имеет активные расписания:"]
         for s in schedules:
             if s["type"] == "oneoff":
-                dt = datetime.fromtimestamp(s["next_run_at"]).strftime("%Y-%m-%d %H:%M")
+                dt = to_moscow_time(s["next_run_at"]).strftime("%Y-%m-%d %H:%M")
                 repeat = _format_repeat_interval(s["repeat_interval"])
                 lines.append(f"📅 Один раз: {dt} ({repeat})")
             else:
@@ -589,7 +674,7 @@ async def delete_schedule(cb: CallbackQuery) -> None:
         lines = [f"✅ Расписание {schedule_id} удалено. Остались расписания:"]
         for s in remaining_schedules:
             if s["type"] == "oneoff":
-                dt = datetime.fromtimestamp(s["next_run_at"]).strftime("%Y-%m-%d %H:%M")
+                dt = to_moscow_time(s["next_run_at"]).strftime("%Y-%m-%d %H:%M")
                 repeat = _format_repeat_interval(s["repeat_interval"])
                 lines.append(f"📅 Один раз: {dt} ({repeat})")
             else:
@@ -644,7 +729,7 @@ async def delete_weekly_schedule(cb: CallbackQuery) -> None:
         lines = [f"✅ Еженедельное расписание {schedule_id} удалено. Остались расписания:"]
         for s in remaining_schedules:
             if s["type"] == "oneoff":
-                dt = datetime.fromtimestamp(s["next_run_at"]).strftime("%Y-%m-%d %H:%M")
+                dt = to_moscow_time(s["next_run_at"]).strftime("%Y-%m-%d %H:%M")
                 repeat = _format_repeat_interval(s["repeat_interval"])
                 lines.append(f"📅 Один раз: {dt} ({repeat})")
             else:
