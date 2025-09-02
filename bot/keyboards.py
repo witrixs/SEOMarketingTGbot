@@ -81,9 +81,9 @@ def weekly_days_kb(selected_days: Optional[Set[int]] = None) -> InlineKeyboardMa
     # Создаем кнопки с галочками для выбранных дней
     for i, day_name in enumerate(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]):
         if i in selected_days:
-            kb.button(text=f"✅ {day_name}", callback_data=f"wday:toggle:{i}")
+            kb.button(text=f"✅ {day_name}", callback_data=f"wday:{i}")
         else:
-            kb.button(text=f"⬜ {day_name}", callback_data=f"wday:toggle:{i}")
+            kb.button(text=f"⬜ {day_name}", callback_data=f"wday:{i}")
     
     kb.button(text="✅ Готово", callback_data="wday:done")
     kb.button(text="◀️ Назад", callback_data="admin:back")
