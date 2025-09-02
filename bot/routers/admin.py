@@ -785,4 +785,99 @@ async def edit_weekly_time_enter(message: Message, state: FSMContext) -> None:
         f"Новое время: {hour:02d}:{minute:02d}\n"
         f"Новые дни: {_format_days_mask(mask)}",
         reply_markup=admin_main_kb()
-    ) 
+    )
+
+
+# Обработчики для глобальной ссылки
+@router.callback_query(F.data == "admin:global_link")
+async def admin_global_link(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    db = get_db()
+    current_link = await db.get_setting("global_link")
+    current_button_text = await db.get_setting("global_button_text") or "🔗 Открыть сайт"
+    
+    text = f"Текущая глобальная ссылка: {current_link or 'не установлена'}\n"
+    text += f"Текущий текст кнопки: {current_button_text}\n\n"
+    text += "Выберите действие:"
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Изменить ссылку", callback_data="admin:change_global_link")
+    kb.button(text="📝 Изменить текст кнопки", callback_data="admin:change_global_button_text")
+    kb.button(text="◀️ Назад", callback_data="admin:back")
+    kb.adjust(1, 1, 1)
+    
+    await cb.message.edit_text(text, reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admin:change_global_link")
+async def change_global_link(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    await cb.message.edit_text(
+        "Введите новую глобальную ссылку (или 'удалить' для удаления):",
+        reply_markup=back_kb()
+    )
+    await state.set_state(GlobalLinkFSM.waiting_for_link)
+    await cb.answer()
+
+
+@router.message(GlobalLinkFSM.waiting_for_link)
+async def receive_global_link(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    
+    db = get_db()
+    text = (message.text or "").strip()
+    
+    if text.lower() in {"удалить", "delete", "remove"}:
+        await db.set_setting("global_link", None)
+        await state.clear()
+        await message.answer("✅ Глобальная ссылка удалена", reply_markup=admin_main_kb())
+        return
+    
+    if not text.startswith(("http://", "https://")):
+        await message.answer(
+            "❌ Ссылка должна начинаться с http:// или https://\nПопробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    await db.set_setting("global_link", text)
+    await state.clear()
+    await message.answer(f"✅ Глобальная ссылка обновлена: {text}", reply_markup=admin_main_kb())
+
+
+@router.callback_query(F.data == "admin:change_global_button_text")
+async def change_global_button_text(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    await cb.message.edit_text(
+        "Введите новый текст для кнопки:",
+        reply_markup=back_kb()
+    )
+    await state.set_state(GlobalButtonTextFSM.waiting_for_text)
+    await cb.answer()
+
+
+@router.message(GlobalButtonTextFSM.waiting_for_text)
+async def receive_global_button_text(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer(
+            "❌ Текст не может быть пустым. Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    db = get_db()
+    await db.set_setting("global_button_text", text)
+    await state.clear()
+    await message.answer(f"✅ Текст кнопки обновлен: {text}", reply_markup=admin_main_kb()) 
