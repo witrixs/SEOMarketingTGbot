@@ -25,6 +25,7 @@
 3. python-dotenv==1.0.0
 4. aiofiles==23.2.1
 5. aiosqlite==0.19.0
+6. pytz==2025.1
 
 ---
 
@@ -249,11 +250,12 @@ CMD ["python", "main.py"]
 ### Медиафайлы
 
 Разместите изображения в папке `media/`:
-- `Global-post.jpg` — картинка для приветственного поста
+- `Global-post.png` — картинка для приветственного поста
 
 ### Кастомизация
 
 - **Дефолтный текст кнопки**: `bot/services/posts.py` → `DEFAULT_BUTTON_TEXT`
+- **Дефолтный пост текст**: `bot/main.py` → `default_text`
 - **Приветственный текст**: `bot/routers/public.py` → `default_text`
 - **Стартовый контент**: `bot/main.py` → функция создания дефолтного поста
 
