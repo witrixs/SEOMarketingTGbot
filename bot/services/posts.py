@@ -53,22 +53,22 @@ async def send_post_to_chat(
     reply_markup = kb.as_markup()
 
     if content_type == "text":
-        await bot.send_message(chat_id, text or "", reply_markup=reply_markup, disable_web_page_preview=True)
+        await bot.send_message(chat_id, text or "", reply_markup=reply_markup, disable_web_page_preview=True, parse_mode='Markdown')
         return
 
     if content_type == "photo" and file_id:
-        await bot.send_photo(chat_id, file_id, caption=text or None, reply_markup=reply_markup)
+        await bot.send_photo(chat_id, file_id, caption=text or None, reply_markup=reply_markup, parse_mode='Markdown')
         return
 
     if content_type == "animation" and file_id:
-        await bot.send_animation(chat_id, file_id, caption=text or None, reply_markup=reply_markup)
+        await bot.send_animation(chat_id, file_id, caption=text or None, reply_markup=reply_markup, parse_mode='Markdown')
         return
 
     if content_type == "video" and file_id:
-        await bot.send_video(chat_id, file_id, caption=text or None, reply_markup=reply_markup)
+        await bot.send_video(chat_id, file_id, caption=text or None, reply_markup=reply_markup, parse_mode='Markdown')
         return
 
-    await bot.send_message(chat_id, (text or "") + "\n\n(Контент недоступен)", reply_markup=reply_markup)
+    await bot.send_message(chat_id, (text or "") + "\n\n(Контент недоступен)", reply_markup=reply_markup, parse_mode='Markdown')
 
 
 async def send_post_to_all_subscribers(
@@ -80,6 +80,7 @@ async def send_post_to_all_subscribers(
     text: Optional[str],
     link_override: Optional[str],
     button_text_override: Optional[str] = None,
+    progress_message=None,
 ) -> Dict[str, int]:
     """
     Отправляет пост всем активным подписчикам и возвращает статистику
@@ -115,6 +116,27 @@ async def send_post_to_all_subscribers(
                 blocked_count += 1
             except Exception as e:
                 logger.warning("Failed to send post to user %s: %s", user_id, e)
+            
+            # Обновляем прогресс каждые 30-50 отправок (случайно) или в конце батча
+            import random
+            update_interval = random.randint(30, 50)
+            if progress_message and (sent_count % update_interval == 0 or len(users) < batch):
+                try:
+                    progress_text = (
+                        f"🚀 Начинаем рассылку...\n\n"
+                        f"✅ Отправлено: {sent_count} пользователям\n"
+                        f"🚫 Заблокировали бота: {blocked_count} пользователей"
+                    )
+                    await progress_message.edit_text(progress_text, reply_markup=progress_message.reply_markup, parse_mode='Markdown')
+                    # Небольшая задержка чтобы избежать flood control
+                    import asyncio
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    # Если flood control - просто пропускаем обновление
+                    if "Flood control" in str(e) or "Too Many Requests" in str(e):
+                        logger.debug("Skipping progress update due to flood control")
+                    else:
+                        logger.warning("Failed to update progress message: %s", e)
                 
         offset += batch
     

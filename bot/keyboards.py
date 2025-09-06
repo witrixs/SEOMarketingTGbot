@@ -9,6 +9,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def admin_main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Новый пост", callback_data="admin:create_post")
+    kb.button(text="🗓 Запланировать пост", callback_data="admin:schedule_post")
     kb.button(text="🗂 Посты", callback_data="admin:list_posts")
     kb.button(text="🕒 Расписания", callback_data="admin:list_schedules")
     kb.button(text="🌐 Глобальная ссылка", callback_data="admin:global_link")

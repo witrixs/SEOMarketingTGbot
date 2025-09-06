@@ -25,6 +25,18 @@ from bot.keyboards import (
 from bot.services.posts import send_post_to_chat, send_post_to_all_subscribers
 from bot.deps import get_db, get_config
 
+def html_to_markdown(text):
+    """Конвертирует HTML теги в Markdown форматирование"""
+    if not text:
+        return text
+    import re
+    # Заменяем HTML теги на Markdown
+    text = re.sub(r'<b>(.*?)</b>', r'*\1*', text)
+    text = re.sub(r'<i>(.*?)</i>', r'_\1_', text)
+    text = re.sub(r'<u>(.*?)</u>', r'_\1_', text)
+    text = re.sub(r'<s>(.*?)</s>', r'~~\1~~', text)
+    return text
+
 router = Router(name="admin")
 
 PAGE_SIZE = 2
@@ -89,6 +101,7 @@ class CreatePostFSM(StatesGroup):
     waiting_for_link = State()
     waiting_for_button_text = State()
     waiting_for_save_or_send = State()
+    waiting_for_publish = State()
 
 
 class EditPostFSM(StatesGroup):
@@ -112,6 +125,24 @@ class GlobalLinkFSM(StatesGroup):
 
 class GlobalButtonTextFSM(StatesGroup):
     waiting_for_text = State()
+
+
+class FastPostFSM(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_content = State()
+    waiting_for_link = State()
+    waiting_for_button_text = State()
+
+
+class SchedulePostFSM(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_content = State()
+    waiting_for_link = State()
+    waiting_for_button_text = State()
+    waiting_for_datetime = State()
+    waiting_for_repeat = State()
+    weekly_select_days = State()
+    waiting_for_weekly_time = State()
 
 
 # Helpers
@@ -322,84 +353,126 @@ async def receive_post_content(message: Message, state: FSMContext) -> None:
 
     await state.update_data(content_type=content_type, file_id=file_id, text=text)
     await state.set_state(CreatePostFSM.waiting_for_link)
-    await message.answer("Укажите индивидуальную ссылку (или напишите 'пропустить'): ", reply_markup=back_kb())
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="createpost:skip_link")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await message.answer("Укажите индивидуальную ссылку или нажмите 'Пропустить' для использования глобальной:", reply_markup=kb.as_markup())
 
+
+@router.callback_query(F.data == "createpost:skip_link")
+async def skip_link(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    await state.update_data(link_override=None)
+    await state.set_state(CreatePostFSM.waiting_for_button_text)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="createpost:skip_button")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await cb.message.edit_text("Укажите текст кнопки или нажмите 'Пропустить' для использования глобального/дефолтного:", reply_markup=kb.as_markup())
+    await cb.answer("Ссылка пропущена")
 
 @router.message(CreatePostFSM.waiting_for_link)
 async def receive_post_link(message: Message, state: FSMContext) -> None:
     if not await _is_admin(message):
         return
-    link_override = None
-    if message.text and message.text.strip().lower() not in {"пропустить", "skip"}:
-        link_override = message.text.strip()
-
+    link_override = message.text.strip() if message.text else None
     await state.update_data(link_override=link_override)
     await state.set_state(CreatePostFSM.waiting_for_button_text)
-    await message.answer("Текст кнопки (или 'пропустить' — будет глобальный/дефолтный):", reply_markup=back_kb())
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="createpost:skip_button")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await message.answer("Укажите текст кнопки или нажмите 'Пропустить' для использования глобального/дефолтного:", reply_markup=kb.as_markup())
 
+
+@router.callback_query(F.data == "createpost:skip_button")
+async def skip_button(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    await state.update_data(button_text=None)
+    data = await state.get_data()
+    # Формируем предпросмотр поста
+    # Конвертируем HTML в Markdown для предпросмотра
+    
+    preview = f"*Предпросмотр поста:*\n"
+    preview += f"*Заголовок:* {data.get('title') or '(нет)'}\n"
+    preview += f"*Текст:* {html_to_markdown(data.get('text')) or '(нет)'}\n"
+    preview += f"*Кнопка:* (глобальная/дефолтная)"
+    await state.set_state(CreatePostFSM.waiting_for_publish)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚀 Выложить пост", callback_data="createpost:publish_now")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await cb.message.edit_text(preview, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await cb.answer("Кнопка пропущена")
 
 @router.message(CreatePostFSM.waiting_for_button_text)
 async def receive_button_text(message: Message, state: FSMContext) -> None:
     if not await _is_admin(message):
         return
-    btn_text = None
-    if message.text and message.text.strip().lower() not in {"пропустить", "skip"}:
-        btn_text = message.text.strip()
-
+    btn_text = message.text.strip() if message.text else None
     await state.update_data(button_text=btn_text)
-    await state.set_state(CreatePostFSM.waiting_for_save_or_send)
-    await message.answer("Сохранить в базу как запланируемый пост или отправить сразу? Напишите 'сохранить' или 'сейчас'.", reply_markup=back_kb())
+    data = await state.get_data()
+    # Формируем предпросмотр поста
+    # Конвертируем HTML в Markdown для предпросмотра
+    
+    preview = f"*Предпросмотр поста:*\n"
+    preview += f"*Заголовок:* {data.get('title') or '(нет)'}\n"
+    preview += f"*Текст:* {html_to_markdown(data.get('text')) or '(нет)'}\n"
+    preview += f"*Кнопка:* {btn_text or '(глобальная/дефолтная)'}"
+    await state.set_state(CreatePostFSM.waiting_for_publish)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚀 Выложить пост", callback_data="createpost:publish_now")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await message.answer(preview, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
-
-@router.message(CreatePostFSM.waiting_for_save_or_send)
-async def save_or_send(message: Message, state: FSMContext) -> None:
-    if not await _is_admin(message):
+@router.callback_query(F.data == "createpost:publish_now")
+async def publish_new_post(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
         return
-    choice = (message.text or "").strip().lower()
     data = await state.get_data()
     db = get_db()
-
-    if choice in {"сейчас", "now"}:
-        # Отправляем пост всем подписчикам
-        stats = await send_post_to_all_subscribers(
-            bot=message.bot,
-            db=db,
-            content_type=data["content_type"],
-            file_id=data.get("file_id"),
-            text=data.get("text"),
-            link_override=data.get("link_override"),
-            button_text_override=data.get("button_text"),
-        )
-        
-        await state.clear()
-        
-        # Показываем статистику рассылки
-        stats_message = (
-            f"📊 Рассылка завершена!\n\n"
-            f"✅ Отправлено: {stats['sent']} пользователям\n"
-            f"🚫 Заблокировали бота: {stats['blocked']} пользователей"
-        )
-        
-        await message.answer(stats_message, reply_markup=admin_main_kb())
-        return
-
-    if choice in {"сохранить", "save"}:
-        post_id = await db.create_post(
-            title=data.get("title"),
-            content_type=data["content_type"],
-            file_id=data.get("file_id"),
-            text=data.get("text"),
-            link_override=data.get("link_override"),
-            button_text=data.get("button_text"),
-        )
-        await state.clear()
-        await message.answer(
-            f"Пост сохранён (ID: {post_id}). Что дальше?",
-            reply_markup=post_actions_kb(post_id),
-        )
-        return
-
-    await message.answer("Не понял. Напишите 'сохранить' или 'сейчас'.", reply_markup=back_kb())
+    
+    # Показываем начальное сообщение о начале рассылки
+    progress_message = await cb.message.answer(
+        "🚀 Начинаем рассылку...\n\n"
+        "✅ Отправлено: 0 пользователям\n"
+        "🚫 Заблокировали бота: 0 пользователей",
+        reply_markup=admin_main_kb()
+    )
+    
+    # Отправляем пост всем подписчикам
+    stats = await send_post_to_all_subscribers(
+        bot=cb.bot,
+        db=db,
+        content_type=data["content_type"],
+        file_id=data.get("file_id"),
+        text=data.get("text"),
+        link_override=data.get("link_override"),
+        button_text_override=data.get("button_text"),
+        progress_message=progress_message,
+    )
+    
+    await state.clear()
+    
+    # Обновляем сообщение с финальной статистикой
+    final_message = (
+        f"📊 Рассылка завершена!\n\n"
+        f"✅ Отправлено: {stats['sent']} пользователям\n"
+        f"🚫 Заблокировали бота: {stats['blocked']} пользователей\n\n"
+        f"📢 Пост отправлен всем пользователям!"
+    )
+    
+    await progress_message.edit_text(final_message, reply_markup=admin_main_kb(), parse_mode='Markdown')
+    await cb.answer("Пост выложен!", show_alert=True) 
 
 
 @router.callback_query(F.data.startswith("post:schedule:"))
@@ -463,7 +536,17 @@ async def sched_weekly_select_days(cb: CallbackQuery, state: FSMContext) -> None
     await state.update_data(weekly_days=days)
     
     # Обновляем клавиатуру с новыми галочками
-    await cb.message.edit_reply_markup(reply_markup=weekly_days_kb(selected_days=days))
+    try:
+        await cb.message.edit_reply_markup(reply_markup=weekly_days_kb(selected_days=days))
+        # Небольшая задержка чтобы избежать flood control
+        import asyncio
+        await asyncio.sleep(0.2)
+    except Exception as e:
+        # Если flood control - просто пропускаем обновление клавиатуры
+        if "Flood control" in str(e) or "Too Many Requests" in str(e):
+            logger.debug("Skipping keyboard update due to flood control")
+        else:
+            logger.warning("Failed to update keyboard: %s", e)
     await cb.answer("OK")
 
 
@@ -496,8 +579,11 @@ async def schedule_datetime_entered(message: Message, state: FSMContext) -> None
     if not await _is_admin(message):
         return
     try:
+        import pytz
+        MOSCOW_TZ = pytz.timezone('Europe/Moscow')
         dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
-        ts = int(time.mktime(dt.timetuple()))
+        dt = MOSCOW_TZ.localize(dt)
+        ts = int(dt.timestamp())
     except Exception:
         await message.answer("Некорректный формат. Пример: 2025-12-31 23:59", reply_markup=back_kb())
         return
@@ -603,7 +689,7 @@ async def admin_stats(cb: CallbackQuery) -> None:
     except Exception as e:
         # Если произошла ошибка, просто отвечаем на callback
         try:
-            await cb.answer("❌ Ошибка при загрузке статистики")
+            await cb.answer("📊 Статистика обновлена")
         except:
             pass  # Игнорируем ошибки с callback
 
@@ -835,7 +921,17 @@ async def edit_weekly_select_days(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(weekly_days=days)
     
     # Обновляем клавиатуру с новыми галочками
-    await cb.message.edit_reply_markup(reply_markup=weekly_days_kb(selected_days=days))
+    try:
+        await cb.message.edit_reply_markup(reply_markup=weekly_days_kb(selected_days=days))
+        # Небольшая задержка чтобы избежать flood control
+        import asyncio
+        await asyncio.sleep(0.2)
+    except Exception as e:
+        # Если flood control - просто пропускаем обновление клавиатуры
+        if "Flood control" in str(e) or "Too Many Requests" in str(e):
+            logger.debug("Skipping keyboard update due to flood control")
+        else:
+            logger.warning("Failed to update keyboard: %s", e)
     await cb.answer("OK") 
 
 
@@ -966,3 +1062,361 @@ async def receive_global_button_text(message: Message, state: FSMContext) -> Non
     await db.set_setting("global_button_text", text)
     await state.clear()
     await message.answer(f"✅ Текст кнопки обновлен: {text}", reply_markup=admin_main_kb()) 
+
+
+@router.callback_query(F.data.startswith("post:publish:"))
+async def publish_saved_post(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    post_id = int(cb.data.split(":")[2])
+    db = get_db()
+    post = await db.get_post(post_id)
+    if not post:
+        await cb.answer("Пост не найден", show_alert=True)
+        return
+    
+    # Показываем начальное сообщение о начале рассылки
+    progress_message = await cb.message.answer(
+        "🚀 Начинаем рассылку...\n\n"
+        "✅ Отправлено: 0 пользователям\n"
+        "🚫 Заблокировали бота: 0 пользователей",
+        reply_markup=admin_main_kb()
+    )
+    
+    # Отправляем пост всем подписчикам
+    stats = await send_post_to_all_subscribers(
+        bot=cb.bot,
+        db=db,
+        content_type=post["content_type"],
+        file_id=post.get("file_id"),
+        text=post.get("text"),
+        link_override=post.get("link_override"),
+        button_text_override=post.get("button_text"),
+        progress_message=progress_message,
+    )
+    
+    # Обновляем сообщение с финальной статистикой
+    final_message = (
+        f"📊 Рассылка завершена!\n\n"
+        f"✅ Отправлено: {stats['sent']} пользователям\n"
+        f"🚫 Заблокировали бота: {stats['blocked']} пользователей\n\n"
+        f"📢 Пост отправлен всем пользователям!"
+    )
+    
+    await progress_message.edit_text(final_message, reply_markup=admin_main_kb(), parse_mode='Markdown')
+    await cb.answer("Пост отправлен!", show_alert=True) 
+
+
+@router.callback_query(F.data == "admin:fast_post")
+async def fast_post_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    await state.set_state(FastPostFSM.waiting_for_title)
+    await cb.message.edit_text("Введите заголовок поста (для админ-списка):", reply_markup=back_kb())
+    await cb.answer()
+
+@router.message(FastPostFSM.waiting_for_title)
+async def fast_post_title(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    await state.update_data(title=(message.text or "").strip() or None)
+    await state.set_state(FastPostFSM.waiting_for_content)
+    await message.answer("Отправьте контент поста: текст, фото, GIF или видео. Подпись используется как текст.", reply_markup=back_kb())
+
+@router.message(FastPostFSM.waiting_for_content)
+async def fast_post_content(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    content_type: Optional[str] = None
+    file_id: Optional[str] = None
+    text: Optional[str] = None
+    if message.photo:
+        content_type = "photo"
+        file_id = message.photo[-1].file_id
+        text = message.caption or None
+    elif message.animation:
+        content_type = "animation"
+        file_id = message.animation.file_id
+        text = message.caption or None
+    elif message.video:
+        content_type = "video"
+        file_id = message.video.file_id
+        text = message.caption or None
+    elif message.text:
+        content_type = "text"
+        file_id = None
+        text = message.text
+    if not content_type:
+        await message.answer("Не удалось распознать контент. Пришлите текст, фото, GIF или видео.", reply_markup=back_kb())
+        return
+    await state.update_data(content_type=content_type, file_id=file_id, text=text)
+    await state.set_state(FastPostFSM.waiting_for_link)
+    await message.answer("Укажите индивидуальную ссылку (или напишите 'пропустить'): ", reply_markup=back_kb())
+
+@router.message(FastPostFSM.waiting_for_link)
+async def fast_post_link(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    link_override = None
+    if message.text and message.text.strip().lower() not in {"пропустить", "skip"}:
+        link_override = message.text.strip()
+    await state.update_data(link_override=link_override)
+    await state.set_state(FastPostFSM.waiting_for_button_text)
+    await message.answer("Текст кнопки (или 'пропустить' — будет глобальный/дефолтный):", reply_markup=back_kb())
+
+@router.message(FastPostFSM.waiting_for_button_text)
+async def fast_post_button_text(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    btn_text = None
+    if message.text and message.text.strip().lower() not in {"пропустить", "skip"}:
+        btn_text = message.text.strip()
+    await state.update_data(button_text=btn_text)
+    data = await state.get_data()
+    db = get_db()
+    stats = await send_post_to_all_subscribers(
+        bot=message.bot,
+        db=db,
+        content_type=data["content_type"],
+        file_id=data.get("file_id"),
+        text=data.get("text"),
+        link_override=data.get("link_override"),
+        button_text_override=data.get("button_text"),
+    )
+    await state.clear()
+    stats_message = (
+        f"📊 Рассылка завершена!\n\n"
+        f"✅ Отправлено: {stats['sent']} пользователям\n"
+        f"🚫 Заблокировали бота: {stats['blocked']} пользователей"
+    )
+    await message.answer(stats_message, reply_markup=admin_main_kb()) 
+
+
+@router.callback_query(F.data == "admin:schedule_post")
+async def schedule_post_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    await state.set_state(SchedulePostFSM.waiting_for_title)
+    await cb.message.edit_text("Введите заголовок поста (для админ-списка):", reply_markup=back_kb())
+    await cb.answer()
+
+@router.message(SchedulePostFSM.waiting_for_title)
+async def schedule_post_title(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    await state.update_data(title=(message.text or "").strip() or None)
+    await state.set_state(SchedulePostFSM.waiting_for_content)
+    await message.answer("Отправьте контент поста: текст, фото, GIF или видео. Подпись используется как текст.", reply_markup=back_kb())
+
+@router.message(SchedulePostFSM.waiting_for_content)
+async def schedule_post_content(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    content_type: Optional[str] = None
+    file_id: Optional[str] = None
+    text: Optional[str] = None
+    if message.photo:
+        content_type = "photo"
+        file_id = message.photo[-1].file_id
+        text = message.caption or None
+    elif message.animation:
+        content_type = "animation"
+        file_id = message.animation.file_id
+        text = message.caption or None
+    elif message.video:
+        content_type = "video"
+        file_id = message.video.file_id
+        text = message.caption or None
+    elif message.text:
+        content_type = "text"
+        file_id = None
+        text = message.text
+    if not content_type:
+        await message.answer("Не удалось распознать контент. Пришлите текст, фото, GIF или видео.", reply_markup=back_kb())
+        return
+    await state.update_data(content_type=content_type, file_id=file_id, text=text)
+    await state.set_state(SchedulePostFSM.waiting_for_link)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="schedulepost:skip_link")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await message.answer("Укажите индивидуальную ссылку или нажмите 'Пропустить' для использования глобальной:", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data == "schedulepost:skip_link")
+async def schedule_skip_link(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    await state.update_data(link_override=None)
+    await state.set_state(SchedulePostFSM.waiting_for_button_text)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="schedulepost:skip_button")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await cb.message.edit_text("Укажите текст кнопки или нажмите 'Пропустить' для использования глобального/дефолтного:", reply_markup=kb.as_markup())
+    await cb.answer("Ссылка пропущена")
+
+@router.message(SchedulePostFSM.waiting_for_link)
+async def schedule_post_link(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    link_override = message.text.strip() if message.text else None
+    await state.update_data(link_override=link_override)
+    await state.set_state(SchedulePostFSM.waiting_for_button_text)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="schedulepost:skip_button")
+    kb.button(text="◀️ Отмена", callback_data="admin:back")
+    kb.adjust(1, 1)
+    await message.answer("Укажите текст кнопки или нажмите 'Пропустить' для использования глобального/дефолтного:", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data == "schedulepost:skip_button")
+async def schedule_skip_button(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    await state.update_data(button_text=None)
+    await state.set_state(SchedulePostFSM.waiting_for_datetime)
+    await cb.message.edit_text("Укажите дату и время публикации в формате YYYY-MM-DD HH:MM (по Москве):", reply_markup=back_kb())
+    await cb.answer("Кнопка пропущена")
+
+@router.message(SchedulePostFSM.waiting_for_button_text)
+async def schedule_post_button_text(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    btn_text = message.text.strip() if message.text else None
+    await state.update_data(button_text=btn_text)
+    await state.set_state(SchedulePostFSM.waiting_for_datetime)
+    await message.answer("Укажите дату и время публикации в формате YYYY-MM-DD HH:MM (по Москве):", reply_markup=back_kb())
+
+@router.message(SchedulePostFSM.waiting_for_datetime)
+async def schedule_post_datetime(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    try:
+        import pytz
+        MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+        dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
+        dt = MOSCOW_TZ.localize(dt)
+        ts = int(dt.timestamp())
+    except Exception:
+        await message.answer("Некорректный формат. Пример: 2025-12-31 23:59", reply_markup=back_kb())
+        return
+    await state.update_data(run_at=ts)
+    await state.set_state(SchedulePostFSM.waiting_for_repeat)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Без повтора", callback_data="schedulepost:repeat:none")
+    kb.button(text="Еженедельно", callback_data="schedulepost:repeat:weekly")
+    kb.adjust(1, 1)
+    await message.answer("Выберите режим повтора:", reply_markup=kb.as_markup())
+
+@router.callback_query(SchedulePostFSM.waiting_for_repeat, F.data.startswith("schedulepost:repeat:"))
+async def schedule_post_repeat(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    repeat_raw = cb.data.split(":")[-1]
+    data = await state.get_data()
+    db = get_db()
+    if repeat_raw == "none":
+        # Разовая рассылка
+        post_id = await db.create_post(
+            title=data.get("title"),
+            content_type=data["content_type"],
+            file_id=data.get("file_id"),
+            text=html_to_markdown(data.get("text")),
+            link_override=data.get("link_override"),
+            button_text=data.get("button_text"),
+        )
+        await db.create_schedule(post_id=post_id, next_run_at=data["run_at"], repeat_interval=None)
+        await state.clear()
+        await cb.message.answer("Пост запланирован!", reply_markup=admin_main_kb())
+        await cb.answer("Пост добавлен в расписание!", show_alert=True)
+        return
+    elif repeat_raw == "weekly":
+        # Переходим к выбору дней недели
+        await state.update_data(weekly_days=set())
+        await state.set_state(SchedulePostFSM.weekly_select_days)
+        await cb.message.edit_text(
+            "Выберите дни недели для рассылки (нажимайте, затем 'Готово'):",
+            reply_markup=weekly_days_kb()
+        )
+        await cb.answer()
+
+@router.message(SchedulePostFSM.weekly_select_days)
+async def schedule_post_weekly_days(message: Message, state: FSMContext) -> None:
+    # Игнорируем обычные сообщения, только кнопки
+    await message.answer("Пожалуйста, выберите дни недели с помощью кнопок ниже.")
+
+@router.callback_query(SchedulePostFSM.weekly_select_days, F.data.startswith("wday:"))
+async def schedule_post_weekly_days_cb(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    _, _, value = cb.data.partition(":")
+    if value == "done":
+        data = await state.get_data()
+        days: set = data.get("weekly_days") or set()
+        if not days:
+            await cb.answer("Выберите хотя бы один день", show_alert=True)
+            return
+        await state.set_state(SchedulePostFSM.waiting_for_weekly_time)
+        await cb.message.edit_text("Укажите время рассылки в формате HH:MM:", reply_markup=back_kb())
+        await cb.answer()
+        return
+    try:
+        d = int(value)
+        if d < 0 or d > 6:
+            raise ValueError
+    except Exception:
+        await cb.answer("Неверный день", show_alert=True)
+        return
+    data = await state.get_data()
+    days: set = data.get("weekly_days") or set()
+    if d in days:
+        days.remove(d)
+    else:
+        days.add(d)
+    await state.update_data(weekly_days=days)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=weekly_days_kb(selected_days=days))
+        # Небольшая задержка чтобы избежать flood control
+        import asyncio
+        await asyncio.sleep(0.2)
+    except Exception as e:
+        # Если flood control - просто пропускаем обновление клавиатуры
+        if "Flood control" in str(e) or "Too Many Requests" in str(e):
+            logger.debug("Skipping keyboard update due to flood control")
+        else:
+            logger.warning("Failed to update keyboard: %s", e)
+    await cb.answer("OK")
+
+@router.message(SchedulePostFSM.waiting_for_weekly_time)
+async def schedule_post_weekly_time(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    try:
+        hh, mm = (message.text or "").strip().split(":", 1)
+        hour, minute = int(hh), int(mm)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except Exception:
+        await message.answer("Неверное время. Пример: 12:30", reply_markup=back_kb())
+        return
+    data = await state.get_data()
+    db = get_db()
+    # Сохраняем пост
+    post_id = await db.create_post(
+        title=data.get("title"),
+        content_type=data["content_type"],
+        file_id=data.get("file_id"),
+        text=html_to_markdown(data.get("text")),
+        link_override=data.get("link_override"),
+        button_text=data.get("button_text"),
+    )
+    days: set = data.get("weekly_days") or set()
+    mask = 0
+    for d in days:
+        mask |= (1 << d)
+    await db.create_weekly_schedule(post_id=post_id, hour=hour, minute=minute, days_mask=mask)
+    await state.clear()
+    await message.answer("Пост запланирован на выбранные дни недели!", reply_markup=admin_main_kb()) 

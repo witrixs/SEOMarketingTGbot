@@ -29,7 +29,7 @@ async def cmd_start(message: Message) -> None:
         "Оставайтесь с нами, чтобы быть первыми! 🚀 Внесите депозит"
     )
 
-    media_path = Path.cwd() / "media" / "Global-post.jpg"
+    media_path = Path.cwd() / "media" / "Global-post.png"
     if media_path.exists():
         file = FSInputFile(str(media_path))
         await send_post_to_chat(
