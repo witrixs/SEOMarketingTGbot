@@ -63,15 +63,15 @@ async def main() -> None:
     bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     dp = Dispatcher()
-    dp.include_router(public_router)
     dp.include_router(admin_router)
+    dp.include_router(public_router)
 
     # Start scheduler
     asyncio.create_task(start_scheduler(bot, db))
 
     try:
         logger.info("Bot polling started")
-        await dp.start_polling(bot, allowed_updates=None)
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member", "chat_join_request"])
     finally:
         await db.close()
 

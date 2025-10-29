@@ -53,22 +53,22 @@ async def send_post_to_chat(
     reply_markup = kb.as_markup()
 
     if content_type == "text":
-        await bot.send_message(chat_id, text or "", reply_markup=reply_markup, disable_web_page_preview=True, parse_mode='Markdown')
+        await bot.send_message(chat_id, text or "", reply_markup=reply_markup, disable_web_page_preview=True)
         return
 
     if content_type == "photo" and file_id:
-        await bot.send_photo(chat_id, file_id, caption=text or None, reply_markup=reply_markup, parse_mode='Markdown')
+        await bot.send_photo(chat_id, file_id, caption=text or None, reply_markup=reply_markup)
         return
 
     if content_type == "animation" and file_id:
-        await bot.send_animation(chat_id, file_id, caption=text or None, reply_markup=reply_markup, parse_mode='Markdown')
+        await bot.send_animation(chat_id, file_id, caption=text or None, reply_markup=reply_markup)
         return
 
     if content_type == "video" and file_id:
-        await bot.send_video(chat_id, file_id, caption=text or None, reply_markup=reply_markup, parse_mode='Markdown')
+        await bot.send_video(chat_id, file_id, caption=text or None, reply_markup=reply_markup)
         return
 
-    await bot.send_message(chat_id, (text or "") + "\n\n(Контент недоступен)", reply_markup=reply_markup, parse_mode='Markdown')
+    await bot.send_message(chat_id, (text or "") + "\n\n(Контент недоступен)", reply_markup=reply_markup)
 
 
 async def send_post_to_all_subscribers(
@@ -127,7 +127,7 @@ async def send_post_to_all_subscribers(
                         f"✅ Отправлено: {sent_count} пользователям\n"
                         f"🚫 Заблокировали бота: {blocked_count} пользователей"
                     )
-                    await progress_message.edit_text(progress_text, reply_markup=progress_message.reply_markup, parse_mode='Markdown')
+                    await progress_message.edit_text(progress_text, reply_markup=progress_message.reply_markup)
                     # Небольшая задержка чтобы избежать flood control
                     import asyncio
                     await asyncio.sleep(0.1)

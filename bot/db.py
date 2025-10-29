@@ -95,6 +95,35 @@ class Database:
                 last_post_id INTEGER
             );
             INSERT OR IGNORE INTO auto_cycle (id, enabled, interval_seconds, last_post_id) VALUES (1, 0, 0, NULL);
+
+            CREATE TABLE IF NOT EXISTS auto_approve_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL UNIQUE,
+                title TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL
+            );
+
+            -- Tracking links for analytics
+            CREATE TABLE IF NOT EXISTS tracking_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                tracking_id TEXT NOT NULL UNIQUE,
+                clicks INTEGER NOT NULL DEFAULT 0,
+                starts INTEGER NOT NULL DEFAULT 0,
+                unique_users INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            -- Track unique users per tracking link
+            CREATE TABLE IF NOT EXISTS tracking_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tracking_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                first_interaction INTEGER NOT NULL,
+                UNIQUE(tracking_id, user_id),
+                FOREIGN KEY(tracking_id) REFERENCES tracking_links(tracking_id) ON DELETE CASCADE
+            );
             """
         )
         await self.connection.commit()
@@ -509,4 +538,170 @@ class Database:
             "UPDATE auto_cycle SET last_post_id = ? WHERE id = 1",
             (last_post_id,),
         )
-        await self.connection.commit() 
+        await self.connection.commit()
+
+    # Auto-approve groups
+    async def add_auto_approve_group(self, chat_id: int, title: Optional[str] = None) -> int:
+        now = int(time.time())
+        async with self.connection.execute(
+            "INSERT INTO auto_approve_groups(chat_id, title, enabled, created_at) VALUES (?, ?, 1, ?)",
+            (chat_id, title, now),
+        ) as cursor:
+            await self.connection.commit()
+            return cursor.lastrowid
+
+    async def remove_auto_approve_group(self, chat_id: int) -> None:
+        await self.connection.execute(
+            "DELETE FROM auto_approve_groups WHERE chat_id = ?",
+            (chat_id,),
+        )
+        await self.connection.commit()
+
+    async def list_auto_approve_groups(self) -> List[Dict[str, Any]]:
+        async with self.connection.execute(
+            "SELECT id, chat_id, title, enabled, created_at FROM auto_approve_groups ORDER BY created_at DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "chat_id": row[1],
+                    "title": row[2],
+                    "enabled": bool(row[3]),
+                    "created_at": row[4],
+                }
+                for row in rows
+            ]
+
+    async def get_auto_approve_group(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        async with self.connection.execute(
+            "SELECT id, chat_id, title, enabled, created_at FROM auto_approve_groups WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "chat_id": row[1],
+                "title": row[2],
+                "enabled": bool(row[3]),
+                "created_at": row[4],
+            }
+
+    async def set_auto_approve_group_enabled(self, chat_id: int, enabled: bool) -> None:
+        await self.connection.execute(
+            "UPDATE auto_approve_groups SET enabled = ? WHERE chat_id = ?",
+            (1 if enabled else 0, chat_id),
+        )
+        await self.connection.commit()
+
+    # Tracking links methods
+    async def create_tracking_link(self, name: str, tracking_id: str) -> int:
+        """Создать новую трекинговую ссылку"""
+        now = int(time.time())
+        async with self.connection.execute(
+            "INSERT INTO tracking_links(name, tracking_id, clicks, starts, unique_users, created_at) VALUES (?, ?, 0, 0, 0, ?)",
+            (name, tracking_id, now),
+        ) as cursor:
+            await self.connection.commit()
+            return cursor.lastrowid
+
+    async def get_tracking_link(self, tracking_id: str) -> Optional[Dict[str, Any]]:
+        """Получить трекинговую ссылку по ID"""
+        async with self.connection.execute(
+            "SELECT id, name, tracking_id, clicks, starts, unique_users, created_at FROM tracking_links WHERE tracking_id = ?",
+            (tracking_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "name": row[1],
+                "tracking_id": row[2],
+                "clicks": row[3],
+                "starts": row[4],
+                "unique_users": row[5],
+                "created_at": row[6],
+            }
+
+    async def list_tracking_links(self) -> List[Dict[str, Any]]:
+        """Получить все трекинговые ссылки"""
+        async with self.connection.execute(
+            "SELECT id, name, tracking_id, clicks, starts, unique_users, created_at FROM tracking_links ORDER BY created_at DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "name": row[1],
+                    "tracking_id": row[2],
+                    "clicks": row[3],
+                    "starts": row[4],
+                    "unique_users": row[5],
+                    "created_at": row[6],
+                }
+                for row in rows
+            ]
+
+    async def delete_tracking_link(self, tracking_id: str) -> None:
+        """Удалить трекинговую ссылку"""
+        await self.connection.execute("DELETE FROM tracking_links WHERE tracking_id = ?", (tracking_id,))
+        await self.connection.commit()
+
+    async def increment_tracking_clicks(self, tracking_id: str) -> None:
+        """Увеличить счетчик кликов для трекинговой ссылки"""
+        await self.connection.execute(
+            "UPDATE tracking_links SET clicks = clicks + 1 WHERE tracking_id = ?",
+            (tracking_id,),
+        )
+        await self.connection.commit()
+
+    async def track_user_interaction(self, tracking_id: str, user_id: int) -> bool:
+        """
+        Отследить взаимодействие пользователя с трекинговой ссылкой.
+        Возвращает True, если это новый пользователь для этой ссылки.
+        """
+        now = int(time.time())
+        
+        # Проверяем, взаимодействовал ли уже этот пользователь с этой ссылкой
+        async with self.connection.execute(
+            "SELECT id FROM tracking_users WHERE tracking_id = ? AND user_id = ?",
+            (tracking_id, user_id),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        
+        if existing:
+            # Пользователь уже взаимодействовал с этой ссылкой
+            await self.connection.execute(
+                "UPDATE tracking_links SET starts = starts + 1 WHERE tracking_id = ?",
+                (tracking_id,),
+            )
+            await self.connection.commit()
+            return False
+        else:
+            # Новый пользователь для этой ссылки
+            await self.connection.execute(
+                "INSERT INTO tracking_users(tracking_id, user_id, first_interaction) VALUES (?, ?, ?)",
+                (tracking_id, user_id, now),
+            )
+            await self.connection.execute(
+                "UPDATE tracking_links SET starts = starts + 1, unique_users = unique_users + 1 WHERE tracking_id = ?",
+                (tracking_id,),
+            )
+            await self.connection.commit()
+            return True
+
+    async def get_tracking_stats(self) -> Dict[str, int]:
+        """Получить общую статистику по всем трекинговым ссылкам"""
+        async with self.connection.execute(
+            "SELECT COUNT(*) as total_links, SUM(clicks) as total_clicks, SUM(starts) as total_starts, SUM(unique_users) as total_unique FROM tracking_links"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return {
+                "total_links": row[0] if row[0] else 0,
+                "total_clicks": row[1] if row[1] else 0,
+                "total_starts": row[2] if row[2] else 0,
+                "total_unique": row[3] if row[3] else 0,
+            } 

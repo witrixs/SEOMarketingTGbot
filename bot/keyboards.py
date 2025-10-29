@@ -12,9 +12,12 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     kb.button(text="🗓 Запланировать пост", callback_data="admin:schedule_post")
     kb.button(text="🗂 Посты", callback_data="admin:list_posts")
     kb.button(text="🕒 Расписания", callback_data="admin:list_schedules")
+    kb.button(text="🤖 Автоответ", callback_data="admin:auto_reply")
     kb.button(text="🌐 Глобальная ссылка", callback_data="admin:global_link")
+    kb.button(text="🔗 Трекинг ссылок", callback_data="admin:tracking_links")
+    kb.button(text="👥 Группы автопринятия", callback_data="admin:auto_approve_groups")
     kb.button(text="📊 Статистика", callback_data="admin:stats")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 1, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -37,12 +40,13 @@ def post_actions_kb(post_id: int, back_page: Optional[int] = None) -> InlineKeyb
     kb.button(text="👁️ Предпросмотр", callback_data=f"post:preview:{post_id}")
     kb.button(text="🚀 Опубликовать", callback_data=f"post:publish:{post_id}")
     kb.button(text="🕒 Запланировать", callback_data=f"post:schedule:{post_id}")
+    kb.button(text="🤖 Установить автоответ", callback_data=f"post:set_auto_reply:{post_id}")
     kb.button(text="🗑 Удалить", callback_data=f"post:delete:{post_id}")
     if back_page is not None:
         kb.button(text="◀️ Назад к списку", callback_data=f"post:back_to_list:{back_page}")
-        kb.adjust(2, 2, 1)
+        kb.adjust(2, 2, 1, 1)
     else:
-        kb.adjust(2, 2)
+        kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -102,4 +106,73 @@ def posts_page_kb(posts: List[Dict], page: int, has_prev: bool, has_next: bool) 
         kb.button(text="Вперёд ➡️", callback_data=f"admin:list_posts:page:{page+1}")
     kb.button(text="◀️ Меню", callback_data="admin:back")
     kb.adjust(2)
+    return kb.as_markup()
+
+
+def auto_approve_groups_kb(groups: List[Dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить группу", callback_data="admin:add_auto_approve_group")
+    kb.button(text="◀️ Назад", callback_data="admin:back")
+    kb.adjust(1, 1)
+    
+    if groups:
+        for group in groups:
+            status = "✅" if group["enabled"] else "❌"
+            title = group["title"] or f"ID {group['chat_id']}"
+            kb.button(
+                text=f"{status} {title}",
+                callback_data=f"admin:auto_approve_group:{group['chat_id']}"
+            )
+        kb.adjust(1)
+    
+    return kb.as_markup()
+
+
+def auto_approve_group_actions_kb(chat_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Включить/Выключить", callback_data=f"admin:toggle_auto_approve_group:{chat_id}")
+    kb.button(text="🗑 Удалить группу", callback_data=f"admin:remove_auto_approve_group:{chat_id}")
+    kb.button(text="◀️ Назад", callback_data="admin:auto_approve_groups")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+# Tracking links keyboards
+def tracking_links_main_kb() -> InlineKeyboardMarkup:
+    """Главное меню трекинга ссылок"""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Создать ссылку", callback_data="tracking:create")
+    kb.button(text="📋 Мои ссылки", callback_data="tracking:list")
+    kb.button(text="📊 Общая статистика", callback_data="tracking:stats")
+    kb.button(text="🔙 Назад", callback_data="admin:back")
+    kb.adjust(1, 1, 1, 1)
+    return kb.as_markup()
+
+
+def tracking_link_actions_kb(tracking_id: str) -> InlineKeyboardMarkup:
+    """Действия с конкретной трекинговой ссылкой"""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Статистика", callback_data=f"tracking:stats:{tracking_id}")
+    kb.button(text="❌ Удалить", callback_data=f"tracking:delete:{tracking_id}")
+    kb.button(text="🔄 Обновить", callback_data=f"tracking:refresh:{tracking_id}")
+    kb.button(text="⬅ Назад", callback_data="tracking:list")
+    kb.adjust(1, 1, 1, 1)
+    return kb.as_markup()
+
+
+def tracking_confirm_delete_kb(tracking_id: str) -> InlineKeyboardMarkup:
+    """Подтверждение удаления трекинговой ссылки"""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да", callback_data=f"tracking:delete_confirm:{tracking_id}")
+    kb.button(text="❌ Нет", callback_data=f"tracking:stats:{tracking_id}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def tracking_stats_kb() -> InlineKeyboardMarkup:
+    """Клавиатура для общей статистики"""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Обновить", callback_data="tracking:stats_refresh")
+    kb.button(text="⬅ Назад", callback_data="admin:tracking_links")
+    kb.adjust(1, 1)
     return kb.as_markup() 

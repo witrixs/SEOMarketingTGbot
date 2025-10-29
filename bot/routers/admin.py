@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Set, List
 import pytz
@@ -21,23 +22,25 @@ from bot.keyboards import (
     schedule_mode_kb,
     weekly_days_kb,
     posts_page_kb,
+    auto_approve_groups_kb,
+    auto_approve_group_actions_kb,
+    tracking_links_main_kb,
+    tracking_link_actions_kb,
+    tracking_confirm_delete_kb,
+    tracking_stats_kb,
 )
 from bot.services.posts import send_post_to_chat, send_post_to_all_subscribers
 from bot.deps import get_db, get_config
 
-def html_to_markdown(text):
-    """Конвертирует HTML теги в Markdown форматирование"""
+# Функция для экранирования HTML символов при отображении в списках
+def escape_html_for_display(text):
+    """Экранирует HTML символы в тексте для безопасного отображения"""
     if not text:
         return text
-    import re
-    # Заменяем HTML теги на Markdown
-    text = re.sub(r'<b>(.*?)</b>', r'*\1*', text)
-    text = re.sub(r'<i>(.*?)</i>', r'_\1_', text)
-    text = re.sub(r'<u>(.*?)</u>', r'_\1_', text)
-    text = re.sub(r'<s>(.*?)</s>', r'~~\1~~', text)
-    return text
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 router = Router(name="admin")
+logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 2
 WEEKDAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -145,6 +148,15 @@ class SchedulePostFSM(StatesGroup):
     waiting_for_weekly_time = State()
 
 
+class AddAutoApproveGroupFSM(StatesGroup):
+    waiting_for_chat_id = State()
+
+
+class TrackingLinkFSM(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_id = State()
+
+
 # Helpers
 async def _is_admin(message: Message) -> bool:
     config = get_config()
@@ -215,8 +227,8 @@ async def _send_posts_page(cb: CallbackQuery, page: int) -> None:
 
     lines = []
     for p in posts:
-        title = p.get("title") or "(без названия)"
-        text = p.get("text") or "(без текста)"
+        title = escape_html_for_display(p.get("title")) or "(без названия)"
+        text = escape_html_for_display(p.get("text")) or "(без текста)"
         lines.append(f"ID {p['id']} • {p['content_type']}\n{title}\n{text[:160]}")
 
     await cb.message.edit_text("\n\n".join(lines), reply_markup=posts_page_kb(posts, page, has_prev, has_next))
@@ -250,9 +262,9 @@ async def open_post(cb: CallbackQuery) -> None:
     if not p:
         await cb.answer("Пост не найден", show_alert=True)
         return
-    title = p.get("title") or "(без названия)"
-    text = p.get("text") or "(без текста)"
-    btn = p.get("button_text") or "(глобальная/деф.)"
+    title = escape_html_for_display(p.get("title")) or "(без названия)"
+    text = escape_html_for_display(p.get("text")) or "(без текста)"
+    btn = escape_html_for_display(p.get("button_text")) or "(глобальная/деф.)"
 
     # collect schedules for this post
     oneoff_lines: List[str] = []
@@ -289,11 +301,47 @@ async def open_post(cb: CallbackQuery) -> None:
                 schedules_block += "\n"
             schedules_block += "Еженедельные:\n" + "\n".join(weekly_lines)
 
+    # Проверяем статус автоответа
+    auto_reply_post_id = await db.get_setting("auto_reply_post_id")
+    auto_reply_status = ""
+    if auto_reply_post_id and int(auto_reply_post_id) == post_id:
+        auto_reply_status = "\n\n🤖 <b>Этот пост установлен как автоответ</b>"
+
     await cb.message.edit_text(
-        f"ID {p['id']} • {p['content_type']}\n{title}\n{text[:1000]}\nКнопка: {btn}{schedules_block}",
+        f"ID {p['id']} • {p['content_type']}\n{title}\n{text[:1000]}\nКнопка: {btn}{schedules_block}{auto_reply_status}",
         reply_markup=post_actions_kb(p["id"], back_page=back_page),
     )
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("post:set_auto_reply:"))
+async def set_auto_reply_post(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    post_id = int(cb.data.split(":")[2])
+    db = get_db()
+    
+    # Проверяем, существует ли пост
+    post = await db.get_post(post_id)
+    if not post:
+        await cb.answer("Пост не найден", show_alert=True)
+        return
+    
+    # Устанавливаем/снимаем автоответ
+    current_auto_reply = await db.get_setting("auto_reply_post_id")
+    
+    if current_auto_reply and int(current_auto_reply) == post_id:
+        # Если этот пост уже установлен как автоответ - отключаем
+        await db.set_setting("auto_reply_post_id", "")
+        await cb.answer("🤖 Автоответ отключен", show_alert=True)
+    else:
+        # Устанавливаем этот пост как автоответ
+        await db.set_setting("auto_reply_post_id", str(post_id))
+        title = escape_html_for_display(post.get("title")) or "Без названия"
+        await cb.answer(f"🤖 Автоответ установлен: {title}", show_alert=True)
+    
+    # Обновляем отображение поста
+    await open_post(cb)
 
 
 @router.callback_query(F.data.startswith("post:back_to_list:"))
@@ -333,19 +381,19 @@ async def receive_post_content(message: Message, state: FSMContext) -> None:
     if message.photo:
         content_type = "photo"
         file_id = message.photo[-1].file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.animation:
         content_type = "animation"
         file_id = message.animation.file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.video:
         content_type = "video"
         file_id = message.video.file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.text:
         content_type = "text"
         file_id = None
-        text = message.text
+        text = message.html_text
 
     if not content_type:
         await message.answer("Не удалось распознать контент. Пришлите текст, фото, GIF или видео.", reply_markup=back_kb())
@@ -396,20 +444,61 @@ async def skip_button(cb: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(button_text=None)
     data = await state.get_data()
-    # Формируем предпросмотр поста
-    # Конвертируем HTML в Markdown для предпросмотра
     
-    preview = f"*Предпросмотр поста:*\n"
-    preview += f"*Заголовок:* {data.get('title') or '(нет)'}\n"
-    preview += f"*Текст:* {html_to_markdown(data.get('text')) or '(нет)'}\n"
-    preview += f"*Кнопка:* (глобальная/дефолтная)"
+    # Формируем предпросмотр поста
+    preview_text = f"<b>Предпросмотр поста:</b>\n"
+    preview_text += f"<b>Заголовок:</b> {data.get('title') or '(нет)'}\n"
+    preview_text += f"<b>Текст:</b> {data.get('text') or '(нет)'}\n"
+    preview_text += f"<b>Кнопка:</b> (глобальная/дефолтная)"
+    
     await state.set_state(CreatePostFSM.waiting_for_publish)
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     kb.button(text="🚀 Выложить пост", callback_data="createpost:publish_now")
     kb.button(text="◀️ Отмена", callback_data="admin:back")
     kb.adjust(1, 1)
-    await cb.message.edit_text(preview, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    
+    # Отправляем предпросмотр с картинкой если есть
+    content_type = data.get('content_type')
+    file_id = data.get('file_id')
+    
+    if content_type == "photo" and file_id:
+        await cb.message.answer_photo(
+            photo=file_id,
+            caption=preview_text,
+            reply_markup=kb.as_markup(),
+        )
+        # Удаляем старое сообщение
+        try:
+            await cb.message.delete()
+        except:
+            pass
+    elif content_type == "animation" and file_id:
+        await cb.message.answer_animation(
+            animation=file_id,
+            caption=preview_text,
+            reply_markup=kb.as_markup(),
+        )
+        # Удаляем старое сообщение
+        try:
+            await cb.message.delete()
+        except:
+            pass
+    elif content_type == "video" and file_id:
+        await cb.message.answer_video(
+            video=file_id,
+            caption=preview_text,
+            reply_markup=kb.as_markup(),
+        )
+        # Удаляем старое сообщение
+        try:
+            await cb.message.delete()
+        except:
+            pass
+    else:
+        # Для текстовых постов используем обычное сообщение
+        await cb.message.edit_text(preview_text, reply_markup=kb.as_markup())
+    
     await cb.answer("Кнопка пропущена")
 
 @router.message(CreatePostFSM.waiting_for_button_text)
@@ -419,20 +508,45 @@ async def receive_button_text(message: Message, state: FSMContext) -> None:
     btn_text = message.text.strip() if message.text else None
     await state.update_data(button_text=btn_text)
     data = await state.get_data()
-    # Формируем предпросмотр поста
-    # Конвертируем HTML в Markdown для предпросмотра
     
-    preview = f"*Предпросмотр поста:*\n"
-    preview += f"*Заголовок:* {data.get('title') or '(нет)'}\n"
-    preview += f"*Текст:* {html_to_markdown(data.get('text')) or '(нет)'}\n"
-    preview += f"*Кнопка:* {btn_text or '(глобальная/дефолтная)'}"
+    # Формируем предпросмотр поста
+    preview_text = f"<b>Предпросмотр поста:</b>\n"
+    preview_text += f"<b>Заголовок:</b> {data.get('title') or '(нет)'}\n"
+    preview_text += f"<b>Текст:</b> {data.get('text') or '(нет)'}\n"
+    preview_text += f"<b>Кнопка:</b> {btn_text or '(глобальная/дефолтная)'}"
+    
     await state.set_state(CreatePostFSM.waiting_for_publish)
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     kb.button(text="🚀 Выложить пост", callback_data="createpost:publish_now")
     kb.button(text="◀️ Отмена", callback_data="admin:back")
     kb.adjust(1, 1)
-    await message.answer(preview, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    
+    # Отправляем предпросмотр с картинкой если есть
+    content_type = data.get('content_type')
+    file_id = data.get('file_id')
+    
+    if content_type == "photo" and file_id:
+        await message.answer_photo(
+            photo=file_id,
+            caption=preview_text,
+            reply_markup=kb.as_markup(),
+        )
+    elif content_type == "animation" and file_id:
+        await message.answer_animation(
+            animation=file_id,
+            caption=preview_text,
+            reply_markup=kb.as_markup(),
+        )
+    elif content_type == "video" and file_id:
+        await message.answer_video(
+            video=file_id,
+            caption=preview_text,
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        # Для текстовых постов используем обычное сообщение
+        await message.answer(preview_text, reply_markup=kb.as_markup())
 
 @router.callback_query(F.data == "createpost:publish_now")
 async def publish_new_post(cb: CallbackQuery, state: FSMContext) -> None:
@@ -471,7 +585,7 @@ async def publish_new_post(cb: CallbackQuery, state: FSMContext) -> None:
         f"📢 Пост отправлен всем пользователям!"
     )
     
-    await progress_message.edit_text(final_message, reply_markup=admin_main_kb(), parse_mode='Markdown')
+    await progress_message.edit_text(final_message, reply_markup=admin_main_kb())
     await cb.answer("Пост выложен!", show_alert=True) 
 
 
@@ -1032,6 +1146,61 @@ async def receive_global_link(message: Message, state: FSMContext) -> None:
     await message.answer(f"✅ Глобальная ссылка обновлена: {text}", reply_markup=admin_main_kb())
 
 
+@router.callback_query(F.data == "admin:auto_reply")
+async def admin_auto_reply(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    db = get_db()
+    auto_reply_post_id = await db.get_setting("auto_reply_post_id")
+    
+    if auto_reply_post_id and auto_reply_post_id.strip():
+        # Если автоответ установлен
+        try:
+            post_id = int(auto_reply_post_id)
+            post = await db.get_post(post_id)
+            
+            if post:
+                title = escape_html_for_display(post.get("title")) or "Без названия"
+                text = f"🤖 <b>Текущий автоответ:</b>\n\n"
+                text += f"<b>Пост ID:</b> {post_id}\n"
+                text += f"<b>Название:</b> {title}\n"
+                text += f"<b>Тип:</b> {post['content_type']}\n\n"
+                text += "Выберите действие:"
+                
+                kb = InlineKeyboardBuilder()
+                kb.button(text="👁️ Показать пост", callback_data=f"admin:open_post:{post_id}:0")
+                kb.button(text="❌ Отключить автоответ", callback_data=f"post:set_auto_reply:{post_id}")
+                kb.button(text="◀️ Назад", callback_data="admin:back")
+                kb.adjust(1, 1, 1)
+                
+                await cb.message.edit_text(text, reply_markup=kb.as_markup())
+                await cb.answer()
+                return
+            else:
+                # Пост не найден - очищаем настройку
+                await db.set_setting("auto_reply_post_id", "")
+        except (ValueError, TypeError):
+            # ID поста некорректный - очищаем настройку
+            await db.set_setting("auto_reply_post_id", "")
+    
+    # Если автоответ не установлен или пост не найден
+    text = "🤖 <b>Автоответ не настроен</b>\n\n"
+    text += "Автоответ позволяет боту отвечать выбранным постом на любое сообщение пользователей.\n\n"
+    text += "Чтобы настроить автоответ:\n"
+    text += "1. Перейдите в <b>🗂 Посты</b>\n"
+    text += "2. Выберите нужный пост\n"
+    text += "3. Нажмите <b>🤖 Установить автоответ</b>"
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗂 Перейти к постам", callback_data="admin:list_posts")
+    kb.button(text="◀️ Назад", callback_data="admin:back")
+    kb.adjust(1, 1)
+    
+    await cb.message.edit_text(text, reply_markup=kb.as_markup())
+    await cb.answer()
+
+
 @router.callback_query(F.data == "admin:change_global_button_text")
 async def change_global_button_text(cb: CallbackQuery, state: FSMContext) -> None:
     if not await _ensure_admin(cb):
@@ -1103,7 +1272,7 @@ async def publish_saved_post(cb: CallbackQuery) -> None:
         f"📢 Пост отправлен всем пользователям!"
     )
     
-    await progress_message.edit_text(final_message, reply_markup=admin_main_kb(), parse_mode='Markdown')
+    await progress_message.edit_text(final_message, reply_markup=admin_main_kb())
     await cb.answer("Пост отправлен!", show_alert=True) 
 
 
@@ -1133,19 +1302,19 @@ async def fast_post_content(message: Message, state: FSMContext) -> None:
     if message.photo:
         content_type = "photo"
         file_id = message.photo[-1].file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.animation:
         content_type = "animation"
         file_id = message.animation.file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.video:
         content_type = "video"
         file_id = message.video.file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.text:
         content_type = "text"
         file_id = None
-        text = message.text
+        text = message.html_text
     if not content_type:
         await message.answer("Не удалось распознать контент. Пришлите текст, фото, GIF или видео.", reply_markup=back_kb())
         return
@@ -1218,19 +1387,19 @@ async def schedule_post_content(message: Message, state: FSMContext) -> None:
     if message.photo:
         content_type = "photo"
         file_id = message.photo[-1].file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.animation:
         content_type = "animation"
         file_id = message.animation.file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.video:
         content_type = "video"
         file_id = message.video.file_id
-        text = message.caption or None
+        text = message.html_text if message.caption else None
     elif message.text:
         content_type = "text"
         file_id = None
-        text = message.text
+        text = message.html_text
     if not content_type:
         await message.answer("Не удалось распознать контент. Пришлите текст, фото, GIF или видео.", reply_markup=back_kb())
         return
@@ -1324,7 +1493,7 @@ async def schedule_post_repeat(cb: CallbackQuery, state: FSMContext) -> None:
             title=data.get("title"),
             content_type=data["content_type"],
             file_id=data.get("file_id"),
-            text=html_to_markdown(data.get("text")),
+            text=data.get("text"),
             link_override=data.get("link_override"),
             button_text=data.get("button_text"),
         )
@@ -1409,7 +1578,7 @@ async def schedule_post_weekly_time(message: Message, state: FSMContext) -> None
         title=data.get("title"),
         content_type=data["content_type"],
         file_id=data.get("file_id"),
-        text=html_to_markdown(data.get("text")),
+        text=data.get("text"),
         link_override=data.get("link_override"),
         button_text=data.get("button_text"),
     )
@@ -1419,4 +1588,508 @@ async def schedule_post_weekly_time(message: Message, state: FSMContext) -> None
         mask |= (1 << d)
     await db.create_weekly_schedule(post_id=post_id, hour=hour, minute=minute, days_mask=mask)
     await state.clear()
-    await message.answer("Пост запланирован на выбранные дни недели!", reply_markup=admin_main_kb()) 
+    await message.answer("Пост запланирован на выбранные дни недели!", reply_markup=admin_main_kb())
+
+
+# Auto-approve groups handlers
+@router.callback_query(F.data == "admin:auto_approve_groups")
+async def list_auto_approve_groups(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    db = get_db()
+    groups = await db.list_auto_approve_groups()
+    
+    if not groups:
+        text = "Группы автопринятия не настроены.\n\nДобавьте группу, чтобы бот автоматически принимал заявки в неё."
+    else:
+        text = "Группы автопринятия:\n\n"
+        for group in groups:
+            status = "✅ Включена" if group["enabled"] else "❌ Выключена"
+            title = group["title"] or f"ID {group['chat_id']}"
+            text += f"{status} {title}\n"
+    
+    await cb.message.edit_text(text, reply_markup=auto_approve_groups_kb(groups))
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admin:add_auto_approve_group")
+async def add_auto_approve_group_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    await cb.message.edit_text(
+        "Введите ID группы (chat_id) для автопринятия заявок.\n\n"
+        "ID группы можно получить, переслав сообщение из группы боту @userinfobot",
+        reply_markup=back_kb()
+    )
+    await state.set_state(AddAutoApproveGroupFSM.waiting_for_chat_id)
+    await cb.answer()
+
+
+@router.message(AddAutoApproveGroupFSM.waiting_for_chat_id)
+async def add_auto_approve_group_chat_id(message: Message, state: FSMContext) -> None:
+    if not await _is_admin(message):
+        return
+    
+    try:
+        chat_id = int(message.text.strip())
+        if chat_id > 0:
+            await message.answer("❌ ID группы должен быть отрицательным числом (например: -1001234567890)")
+            return
+    except ValueError:
+        await message.answer("❌ Неверный формат ID. Введите числовой ID группы.")
+        return
+    
+    db = get_db()
+    
+    # Проверяем, не добавлена ли уже эта группа
+    existing_group = await db.get_auto_approve_group(chat_id)
+    if existing_group:
+        await message.answer(f"❌ Группа с ID {chat_id} уже добавлена в список автопринятия.")
+        return
+    
+    try:
+        # Пытаемся получить информацию о группе
+        chat = await message.bot.get_chat(chat_id)
+        title = chat.title
+        
+        # Добавляем группу в базу
+        await db.add_auto_approve_group(chat_id, title)
+        
+        await state.clear()
+        await message.answer(
+            f"✅ Группа добавлена в список автопринятия!\n\n"
+            f"Название: {title}\n"
+            f"ID: {chat_id}",
+            reply_markup=admin_main_kb()
+        )
+    except Exception as e:
+        await message.answer(
+            f"❌ Не удалось добавить группу. Проверьте:\n"
+            f"1. Правильность ID группы\n"
+            f"2. Что бот добавлен в группу как администратор\n"
+            f"3. Что у бота есть права на принятие заявок\n\n"
+            f"Ошибка: {str(e)}"
+        )
+
+
+@router.callback_query(F.data.startswith("admin:auto_approve_group:"))
+async def auto_approve_group_details(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    chat_id = int(cb.data.split(":")[2])
+    db = get_db()
+    group = await db.get_auto_approve_group(chat_id)
+    
+    if not group:
+        await cb.answer("Группа не найдена", show_alert=True)
+        return
+    
+    status = "✅ Включена" if group["enabled"] else "❌ Выключена"
+    title = group["title"] or f"ID {group['chat_id']}"
+    
+    text = f"Группа автопринятия:\n\n"
+    text += f"Название: {title}\n"
+    text += f"ID: {group['chat_id']}\n"
+    text += f"Статус: {status}\n"
+    text += f"Добавлена: {to_moscow_time(group['created_at']).strftime('%Y-%m-%d %H:%M')}"
+    
+    await cb.message.edit_text(text, reply_markup=auto_approve_group_actions_kb(chat_id))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin:toggle_auto_approve_group:"))
+async def toggle_auto_approve_group(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    chat_id = int(cb.data.split(":")[2])
+    db = get_db()
+    group = await db.get_auto_approve_group(chat_id)
+    
+    if not group:
+        await cb.answer("Группа не найдена", show_alert=True)
+        return
+    
+    new_status = not group["enabled"]
+    await db.set_auto_approve_group_enabled(chat_id, new_status)
+    
+    status_text = "включена" if new_status else "выключена"
+    await cb.answer(f"Группа {status_text}")
+    
+    # Обновляем сообщение
+    await auto_approve_group_details(cb)
+
+
+@router.callback_query(F.data.startswith("admin:remove_auto_approve_group:"))
+async def remove_auto_approve_group(cb: CallbackQuery) -> None:
+    if not await _ensure_admin(cb):
+        return
+    
+    chat_id = int(cb.data.split(":")[2])
+    db = get_db()
+    group = await db.get_auto_approve_group(chat_id)
+    
+    if not group:
+        await cb.answer("Группа не найдена", show_alert=True)
+        return
+    
+    title = group["title"] or f"ID {group['chat_id']}"
+    await db.remove_auto_approve_group(chat_id)
+    
+    await cb.message.edit_text(
+        f"✅ Группа '{title}' удалена из списка автопринятия.",
+        reply_markup=back_kb()
+    )
+    await cb.answer()
+
+
+# Tracking links handlers
+@router.callback_query(F.data == "admin:tracking_links")
+async def tracking_links_main(cb: CallbackQuery) -> None:
+    """Главное меню трекинга ссылок"""
+    if not await _ensure_admin(cb):
+        return
+    
+    await cb.message.edit_text(
+        "🌐 <b>Трекинг ссылок</b>\n\n"
+        "Управление ссылками и аналитикой трафика через inline-интерфейс.\n\n"
+        "Выберите действие:",
+        reply_markup=tracking_links_main_kb()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "tracking:create")
+async def tracking_create_start(cb: CallbackQuery, state: FSMContext) -> None:
+    """Начать создание новой трекинговой ссылки"""
+    if not await _ensure_admin(cb):
+        return
+    
+    await cb.message.edit_text(
+        "➕ <b>Создание трекинговой ссылки</b>\n\n"
+        "Введите имя для ссылки (например, 'insta_ads'):",
+        reply_markup=back_kb()
+    )
+    await state.set_state(TrackingLinkFSM.waiting_for_name)
+    await cb.answer()
+
+
+@router.message(TrackingLinkFSM.waiting_for_name)
+async def tracking_create_name(message: Message, state: FSMContext) -> None:
+    """Обработка ввода имени трекинговой ссылки"""
+    if not await _is_admin(message):
+        return
+    
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(
+            "❌ Имя не может быть пустым. Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    # Проверяем, что имя содержит только допустимые символы
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        await message.answer(
+            "❌ Имя может содержать только буквы, цифры, дефисы и подчеркивания. Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    # Сохраняем имя и переходим к вводу ID
+    await state.update_data(name=name)
+    await state.set_state(TrackingLinkFSM.waiting_for_id)
+    
+    await message.answer(
+        f"✅ Имя ссылки: <code>{name}</code>\n\n"
+        f"🔗 Теперь введите кастомный ID для ссылки (например: 'promo2024', 'insta_ads'):\n\n"
+        f"<i>ID может содержать только буквы, цифры, дефисы и подчеркивания</i>",
+        reply_markup=back_kb()
+    )
+
+
+@router.message(TrackingLinkFSM.waiting_for_id)
+async def tracking_create_id(message: Message, state: FSMContext) -> None:
+    """Обработка ввода ID трекинговой ссылки"""
+    if not await _is_admin(message):
+        return
+    
+    tracking_id = (message.text or "").strip()
+    if not tracking_id:
+        await message.answer(
+            "❌ ID не может быть пустым. Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    # Проверяем, что ID содержит только допустимые символы
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+$', tracking_id):
+        await message.answer(
+            "❌ ID может содержать только буквы, цифры, дефисы и подчеркивания. Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    # Проверяем длину ID (не слишком короткий и не слишком длинный)
+    if len(tracking_id) < 3:
+        await message.answer(
+            "❌ ID слишком короткий (минимум 3 символа). Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    if len(tracking_id) > 50:
+        await message.answer(
+            "❌ ID слишком длинный (максимум 50 символов). Попробуйте еще раз:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    db = get_db()
+    
+    # Проверяем, не занят ли уже такой ID
+    existing_link = await db.get_tracking_link(tracking_id)
+    if existing_link:
+        await message.answer(
+            f"❌ <b>ID уже занят!</b>\n\n"
+            f"ID '<code>{tracking_id}</code>' уже используется для ссылки '<code>{existing_link['name']}</code>'.\n\n"
+            f"Попробуйте другой ID:",
+            reply_markup=back_kb()
+        )
+        return
+    
+    # Получаем сохраненное имя
+    data = await state.get_data()
+    name = data.get("name")
+    
+    if not name:
+        await message.answer(
+            "❌ Ошибка: имя ссылки не найдено. Начните заново:",
+            reply_markup=admin_main_kb()
+        )
+        await state.clear()
+        return
+    
+    try:
+        # Создаем трекинговую ссылку
+        await db.create_tracking_link(name, tracking_id)
+        
+        # Получаем информацию о боте для создания ссылки
+        bot_info = await message.bot.get_me()
+        bot_username = bot_info.username
+        
+        referral_link = f"https://t.me/{bot_username}?start={tracking_id}"
+        
+        await state.clear()
+        
+        # Отправляем подтверждение с кнопками
+        await message.answer(
+            f"🎉 <b>Ссылка успешно создана!</b>\n\n"
+            f"📛 Имя: <code>{name}</code>\n"
+            f"🔗 ID: <code>{tracking_id}</code>\n"
+            f"🌐 Ссылка: <code>{referral_link}</code>\n\n"
+            f"📊 Статистика пока пуста, но начнет обновляться как только кто-то перейдет по ссылке!",
+            reply_markup=tracking_link_actions_kb(tracking_id)
+        )
+        
+    except Exception as e:
+        await message.answer(
+            f"❌ Ошибка при создании ссылки: {str(e)}",
+            reply_markup=admin_main_kb()
+        )
+        await state.clear()
+
+
+@router.callback_query(F.data == "tracking:list")
+async def tracking_list_links(cb: CallbackQuery) -> None:
+    """Показать список всех трекинговых ссылок"""
+    if not await _ensure_admin(cb):
+        return
+    
+    db = get_db()
+    links = await db.list_tracking_links()
+    
+    if not links:
+        await cb.message.edit_text(
+            "📋 <b>Мои ссылки</b>\n\n"
+            "У вас пока нет трекинговых ссылок.\n"
+            "Создайте первую ссылку с помощью кнопки ниже.",
+            reply_markup=tracking_links_main_kb()
+        )
+        await cb.answer()
+        return
+    
+    # Формируем список ссылок
+    text = "📋 <b>Мои ссылки</b>\n\n"
+    
+    kb = InlineKeyboardBuilder()
+    
+    for link in links:
+        created_date = to_moscow_time(link["created_at"]).strftime("%Y-%m-%d")
+        
+        card_text = (
+            f"📛 Имя: <code>{link['name']}</code>\n"
+            f"🔗 ID: <code>{link['tracking_id']}</code>\n"
+            f"👁 Клики: <b>{link['clicks']}</b>\n"
+            f"🚀 Старты: <b>{link['starts']}</b>\n"
+            f"👤 Уникальные: <b>{link['unique_users']}</b>\n"
+            f"🕒 Создано: {created_date}\n"
+        )
+        
+        text += card_text + "\n"
+        
+        # Добавляем кнопки для каждой ссылки
+        kb.button(
+            text=f"🔧 {link['name']}", 
+            callback_data=f"tracking:stats:{link['tracking_id']}"
+        )
+    
+    kb.button(text="🔙 Назад", callback_data="admin:tracking_links")
+    kb.adjust(2, 2, 1)  # По 2 кнопки в ряд, последняя отдельно
+    
+    await cb.message.edit_text(text, reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("tracking:stats:"))
+async def tracking_link_stats(cb: CallbackQuery) -> None:
+    """Показать статистику конкретной ссылки"""
+    if not await _ensure_admin(cb):
+        return
+    
+    tracking_id = cb.data.split(":")[2]
+    
+    db = get_db()
+    link = await db.get_tracking_link(tracking_id)
+    
+    if not link:
+        await cb.answer("Ссылка не найдена", show_alert=True)
+        return
+    
+    # Получаем информацию о боте для показа полной ссылки
+    bot_info = await cb.bot.get_me()
+    bot_username = bot_info.username
+    referral_link = f"https://t.me/{bot_username}?start={tracking_id}"
+    
+    created_date = to_moscow_time(link["created_at"]).strftime("%Y-%m-%d %H:%M")
+    
+    text = (
+        f"📊 <b>Статистика ссылки</b>\n\n"
+        f"📛 Имя: <code>{link['name']}</code>\n"
+        f"🔗 ID: <code>{link['tracking_id']}</code>\n"
+        f"🌐 Ссылка: <code>{referral_link}</code>\n\n"
+        f"📈 <b>Аналитика:</b>\n"
+        f"👁 Клики: <b>{link['clicks']}</b>\n"
+        f"🚀 Старты: <b>{link['starts']}</b>\n"
+        f"👤 Уникальные: <b>{link['unique_users']}</b>\n\n"
+        f"🕒 Создано: {created_date}"
+    )
+    
+    await cb.message.edit_text(text, reply_markup=tracking_link_actions_kb(tracking_id))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("tracking:refresh:"))
+async def tracking_refresh_stats(cb: CallbackQuery) -> None:
+    """Обновить статистику ссылки"""
+    if not await _ensure_admin(cb):
+        return
+    
+    tracking_id = cb.data.split(":")[2]
+    
+    # Показываем сообщение о загрузке
+    await cb.answer("⏳ Обновляю...", show_alert=False)
+    
+    # Обновляем данные через callback_query edit
+    await tracking_link_stats(cb)
+
+
+@router.callback_query(F.data.startswith("tracking:delete:"))
+async def tracking_delete_confirm(cb: CallbackQuery) -> None:
+    """Подтвердить удаление ссылки"""
+    if not await _ensure_admin(cb):
+        return
+    
+    tracking_id = cb.data.split(":")[2]
+    
+    db = get_db()
+    link = await db.get_tracking_link(tracking_id)
+    
+    if not link:
+        await cb.answer("Ссылка не найдена", show_alert=True)
+        return
+    
+    await cb.message.edit_text(
+        f"⚠️ <b>Удалить ссылку?</b>\n\n"
+        f"📛 Имя: <code>{link['name']}</code>\n"
+        f"🔗 ID: <code>{link['tracking_id']}</code>\n\n"
+        f"Это действие нельзя отменить!",
+        reply_markup=tracking_confirm_delete_kb(tracking_id)
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("tracking:delete_confirm:"))
+async def tracking_delete_execute(cb: CallbackQuery) -> None:
+    """Выполнить удаление ссылки"""
+    if not await _ensure_admin(cb):
+        return
+    
+    tracking_id = cb.data.split(":")[2]
+    
+    db = get_db()
+    link = await db.get_tracking_link(tracking_id)
+    
+    if not link:
+        await cb.answer("Ссылка не найдена", show_alert=True)
+        return
+    
+    # Удаляем ссылку
+    await db.delete_tracking_link(tracking_id)
+    
+    await cb.message.edit_text(
+        f"✅ <b>Ссылка удалена</b>\n\n"
+        f"Ссылка '<code>{link['name']}</code>' была успешно удалена.",
+        reply_markup=tracking_links_main_kb()
+    )
+    await cb.answer("Ссылка удалена", show_alert=True)
+
+
+@router.callback_query(F.data.in_({"tracking:stats", "tracking:stats_refresh"}))
+async def tracking_global_stats(cb: CallbackQuery) -> None:
+    """Общая статистика по всем трекинговым ссылкам"""
+    if not await _ensure_admin(cb):
+        return
+    
+    is_refresh = cb.data == "tracking:stats_refresh"
+    
+    if is_refresh:
+        await cb.answer("⏳ Обновляю...", show_alert=False)
+    
+    db = get_db()
+    stats = await db.get_tracking_stats()
+    
+    text = (
+        f"📊 <b>Общая статистика</b>\n\n"
+        f"📈 Всего ссылок: <b>{stats['total_links']}</b>\n"
+        f"👁 Общие клики: <b>{stats['total_clicks']}</b>\n"
+        f"🚀 Общие старты: <b>{stats['total_starts']}</b>\n"
+        f"👤 Уникальные пользователи: <b>{stats['total_unique']}</b>"
+    )
+    
+    await cb.message.edit_text(text, reply_markup=tracking_stats_kb())
+    
+    if is_refresh:
+        await cb.answer("📊 Статистика обновлена")
+    else:
+        await cb.answer()
+
+
+
+
+
